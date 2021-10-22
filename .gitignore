@@ -1,0 +1,5 @@
+src/evaluations/events.out*
+src/SAC_model/*.pt
+src/replay_memory/*.pt
+*.pyc
+src/core

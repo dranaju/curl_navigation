@@ -48,9 +48,9 @@ class Env():
         self.get_goalbox = False
         self.heading = 0
         self.position = Pose()
-        self.pub_cmd_vel = rospy.Publisher('cmd_vel', Twist, queue_size=5)
-        self.sub_odom = rospy.Subscriber('odom', Odometry, self.get_odometry)
-        self.reset_proxy = rospy.ServiceProxy('gazebo/reset_simulation', Empty)
+        self.pub_cmd_vel = self.pub_cmd_vel = rospy.Publisher('/hydrone_aerial_underwater/cmd_vel', Twist, queue_size=5)
+        self.sub_odom = rospy.Subscriber('/hydrone_aerial_underwater/ground_truth/odometry', Odometry, self.get_odometry)
+        self.reset_proxy = rospy.ServiceProxy('gazebo/reset_world', Empty)
         self.unpause_proxy = rospy.ServiceProxy('gazebo/unpause_physics', Empty)
         self.pause_proxy = rospy.ServiceProxy('gazebo/pause_physics', Empty)
         self.past_distance = 0.
@@ -59,7 +59,8 @@ class Env():
         self.bridge = CvBridge()
         self._frames = deque([], maxlen=3)
         self._frames_print = deque([], maxlen=3)
-        self.image_sub = rospy.Subscriber('/camera/rgb/image_raw', Image, self.image_callback)
+        # self.image_sub = rospy.Subscriber('/hydrone_aerial_underwater/camera/rgb/image_raw', Image, self.image_callback)
+        self.image_sub = rospy.Subscriber("/hydrone_aerial_underwater/camera/depth/image_raw", Image, self.image_callback)
         rospy.sleep(1)
         #Keys CTRL + c will stop script
         rospy.on_shutdown(self.shutdown)
@@ -72,9 +73,20 @@ class Env():
 
     def image_callback(self, data):
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
-            self.cv_image = cv2.resize(cv_image.copy(), (100, 100), interpolation = cv2.INTER_AREA)
-            cv2.imshow("Current_Observation", self.cv_image)
+            # cv_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
+            # self.cv_image = cv2.resize(cv_image.copy(), (100, 100), interpolation = cv2.INTER_AREA)
+            cv_image = self.bridge.imgmsg_to_cv2(data, data.encoding)
+            nan_location = np.isnan(cv_image)
+            # print(aux1.max())
+            cv_image[nan_location] = np.nanmax(cv_image)
+            norm_image =  (cv_image)*255./5.
+            norm_image[0,0] = 255.
+            norm_image = norm_image.astype('uint8')
+
+            # norm_image = cv2.normalize(norm_image, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+            norm_image = cv2.resize(norm_image.copy(), (100, 100), interpolation = cv2.INTER_AREA)
+            self.cv_image = cv2.cvtColor(norm_image, cv2.COLOR_GRAY2BGR)
+            cv2.imshow("Current_Observation", cv2.resize(self.cv_image.copy(), (500, 400), interpolation = cv2.INTER_AREA))
             cv2.waitKey(3)
         except CvBridgeError as e:
             print(e)
@@ -110,12 +122,12 @@ class Env():
     def getState(self, scan):
         scan_range = []
         # heading = self.heading
-        min_range = 0.136
+        min_range = 0.625
         done = False
 
         for i in range(len(scan.ranges)):
             if scan.ranges[i] == float('Inf') or scan.ranges[i] == float('inf'):
-                scan_range.append(3.5)
+                scan_range.append(20)
             elif np.isnan(scan.ranges[i]) or scan.ranges[i] == float('nan'):
                 scan_range.append(0)
             else:
@@ -128,7 +140,7 @@ class Env():
         return self.cv_image.transpose(2, 0, 1).copy(), done
 
     def setReward(self, state, done):
-        reward = 0
+        reward = 0.1
 
         if done:
             rospy.loginfo("Collision!!")
@@ -140,7 +152,7 @@ class Env():
         return reward, done
 
     def step(self, action):
-        linear_vel = action[0]
+        linear_vel = action[0] + 0.02
         ang_vel = action[1]
 
         vel_cmd = Twist()
@@ -151,7 +163,7 @@ class Env():
         data = None
         while data is None:
             try:
-                data = rospy.wait_for_message('scan', LaserScan, timeout=5)
+                data = rospy.wait_for_message('/hydrone_aerial_underwater/scan', LaserScan, timeout=5)
             except:
                 pass
 
@@ -178,7 +190,7 @@ class Env():
         data = None
         while data is None:
             try:
-                data = rospy.wait_for_message('scan', LaserScan, timeout=5)
+                data = rospy.wait_for_message('/hydrone_aerial_underwater/scan', LaserScan, timeout=5)
             except:
                 pass
         

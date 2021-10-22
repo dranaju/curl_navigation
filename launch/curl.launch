@@ -1,0 +1,3 @@
+<launch>
+  <node pkg="curl_navigation" type="curl_prio.py" name="curl_node" output="screen" />
+</launch>
