@@ -11,7 +11,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 from collections import deque
 from std_msgs.msg import Float32
-from environment_hydrone import Env
+from environment_hydrone_sac import Env
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -38,6 +38,7 @@ from collections import deque
 import random
 from torch.utils.data import Dataset, DataLoader
 from skimage.util.shape import view_as_windows
+
 
 class eval_mode(object):
     def __init__(self, *models):
@@ -99,12 +100,7 @@ def preprocess_obs(obs, bits=5):
 
 class ReplayBuffer(Dataset):
     """Buffer to store environment transitions."""
-    def __init__(
-                self, obs_shape, action_shape, 
-                capacity, batch_size, device,
-                image_size=84,transform=None,
-                alpha=0.6,beta_start = 0.4,beta_frames=100000
-                ):
+    def __init__(self, obs_shape, action_shape, capacity, batch_size, device,image_size=84,transform=None):
         self.capacity = capacity
         self.batch_size = batch_size
         self.device = device
@@ -126,32 +122,11 @@ class ReplayBuffer(Dataset):
         self.last_save = 0
         self.full = False
 
-        self.alpha = alpha
-        self.beta_start = beta_start
-        self.beta_frames = beta_frames
-        self.frame = 1 #for beta calculation
-        self.priorities = np.zeros((capacity,), dtype=np.float32)
-
-
-    def beta_by_frame(self, frame_idx):
-        """
-        Linearly increases beta from beta_start to 1 over time from 1 to beta_frames.
-        
-        3.4 ANNEALING THE BIAS (Paper: PER)
-        We therefore exploit the flexibility of annealing the amount of importance-sampling
-        correction over time, by defining a schedule on the exponent 
-        that reaches 1 only at the end of learning. In practice, we linearly anneal from its initial value 0 to 1
-        """
-        return min(1.0, self.beta_start + frame_idx * (1.0 - self.beta_start) / self.beta_frames)
-
 
     
 
     def add(self, obs, pose, action, reward, next_obs, next_pose, done):
-
-        max_prio = self.priorities.max() if (self.idx == 0 and not self.full) else 1.0
-        # print('max_prio', max_prio)
-
+       
         np.copyto(self.obses[self.idx], obs)
         np.copyto(self.poses[self.idx], pose)
         np.copyto(self.actions[self.idx], action)
@@ -160,87 +135,25 @@ class ReplayBuffer(Dataset):
         np.copyto(self.next_poses[self.idx], next_pose)
         np.copyto(self.not_dones[self.idx], not done)
 
-        self.priorities[self.idx] = max_prio
         self.idx = (self.idx + 1) % self.capacity
         self.full = self.full or self.idx == 0
 
-    def sample_proprio(self):
-        
+    def sample(self):
         idxs = np.random.randint(
             0, self.capacity if self.full else self.idx, size=self.batch_size
         )
-        
-        obses = self.obses[idxs]
-        next_obses = self.next_obses[idxs]
 
-        obses = torch.as_tensor(obses, device=self.device).float()
-        poses = torch.as_tensor(self.poses[idxs], device=self.device)
+        obses = torch.as_tensor(self.obses[idxs], device=self.device).float()
+        poses = torch.as_tensor(np.array(self.poses[idxs]), device=self.device)
+        next_poses = torch.as_tensor(np.array(self.next_poses[idxs]), device=self.device) 
         actions = torch.as_tensor(self.actions[idxs], device=self.device)
         rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
         next_obses = torch.as_tensor(
-            next_obses, device=self.device
+            self.next_obses[idxs], device=self.device
         ).float()
-        next_poses = torch.as_tensor(self.next_poses[idxs], device=self.device)
         not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)
+
         return obses, poses, actions, rewards, next_obses, next_poses, not_dones
-
-    def sample_cpc(self):
-        if not self.full:
-            N = self.idx
-        else:
-            N = self.capacity
-
-        if N == self.capacity:
-            prios = self.priorities
-        else:
-            prios = self.priorities[:self.idx]
-
-        # calc P = p^a/sum(p^a)
-        probs  = prios ** self.alpha
-        P = probs/probs.sum()
-        
-        #gets the indices depending on the probability p
-        indices = np.random.choice(N, self.batch_size, p=P)
-        
-        beta = self.beta_by_frame(self.frame)
-        self.frame+=1
-                
-        #Compute importance-sampling weight
-        weights  = (N * P[indices]) ** (-beta)
-        # normalize weights
-        weights /= weights.max() 
-        weights  = np.array(weights, dtype=np.float32) 
-        
-
-        # start = time.time()
-        # idxs = np.random.randint(
-        #     0, self.capacity if self.full else self.idx, size=self.batch_size
-        # )
-        # print(type(self.obses))
-        obses = np.array([self.obses[idxs] for idxs in indices])
-        next_obses = np.array([self.next_obses[idxs] for idxs in indices])
-        pos = obses.copy()
-
-        obses = random_crop(obses, self.image_size)
-        next_obses = random_crop(next_obses, self.image_size)
-        pos = random_crop(pos, self.image_size)
-    
-        obses = torch.as_tensor(obses, device=self.device).float()
-        next_obses = torch.as_tensor(
-            next_obses, device=self.device
-        ).float()
-        poses = torch.as_tensor(np.array([self.poses[idxs] for idxs in indices]), device=self.device) 
-        next_poses = torch.as_tensor(np.array([self.next_poses[idxs] for idxs in indices]), device=self.device)
-
-        actions = torch.as_tensor(np.array([self.actions[idxs] for idxs in indices]), device=self.device) 
-        rewards = torch.as_tensor(np.array([self.rewards[idxs] for idxs in indices]), device=self.device)
-        not_dones = torch.as_tensor(np.array([self.not_dones[idxs] for idxs in indices]), device=self.device)
-
-        pos = torch.as_tensor(pos, device=self.device).float()
-        cpc_kwargs = dict(obs_anchor=obses, obs_pos=pos,
-                          time_anchor=None, time_pos=None)
-
-        return obses, poses, actions, rewards, next_obses, next_poses, not_dones, cpc_kwargs, indices, weights
 
     def save(self, save_dir):
         if self.idx == self.last_save:
@@ -270,32 +183,7 @@ class ReplayBuffer(Dataset):
             self.rewards[start:end] = payload[3]
             self.not_dones[start:end] = payload[4]
             self.idx = end
-            self.last_save = end
-        print('Load memory until:' + str(self.idx))
 
-    def update_priorities(self, batch_indices, batch_priorities):
-        for idx, prio in zip(batch_indices, batch_priorities):
-            self.priorities[idx] = abs(prio) 
-
-    # def __getitem__(self, idx):
-    #     idx = np.random.randint(
-    #         0, self.capacity if self.full else self.idx, size=1
-    #     )
-    #     idx = idx[0]
-    #     obs = self.obses[idx]
-    #     action = self.actions[idx]
-    #     reward = self.rewards[idx]
-    #     next_obs = self.next_obses[idx]
-    #     not_done = self.not_dones[idx]
-
-    #     if self.transform:
-    #         obs = self.transform(obs)
-    #         next_obs = self.transform(next_obs)
-
-    #     return obs, action, reward, next_obs, not_done
-
-    def __len__(self):
-        return self.capacity 
 
 # class FrameStack(gym.Wrapper):
 #     def __init__(self, env, k):
@@ -327,37 +215,17 @@ class ReplayBuffer(Dataset):
 #         return np.concatenate(list(self._frames), axis=0)
 
 
-def random_crop(imgs, output_size):
-    """
-    Vectorized way to do random crop using sliding windows
-    and picking out random ones
 
-    args:
-        imgs, batch images with shape (B,C,H,W)
-    """
-    # batch size
-    n = imgs.shape[0]
-    img_size = imgs.shape[-1]
-    crop_max = img_size - output_size
-    imgs = np.transpose(imgs, (0, 2, 3, 1))
-    w1 = np.random.randint(0, crop_max, n)
-    h1 = np.random.randint(0, crop_max, n)
-    # creates all sliding windows combinations of size (output_size)
-    windows = view_as_windows(
-        imgs, (1, output_size, output_size, 1))[..., 0,:,:, 0]
-    # selects a random window for each batch element
-    cropped_imgs = windows[np.arange(n), w1, h1]
-    return cropped_imgs
 
-def center_crop_image(image, output_size):
-    h, w = image.shape[1:]
-    new_h, new_w = output_size, output_size
 
-    top = (h - new_h)//2
-    left = (w - new_w)//2
 
-    image = image[:, top:top + new_h, left:left + new_w]
-    return image
+
+
+
+
+#------------------------------------------------------------
+
+
 
 def tie_weights(src, trg):
     assert type(src) == type(trg)
@@ -365,19 +233,16 @@ def tie_weights(src, trg):
     trg.bias = src.bias
 
 
-# for 84 x 84 inputs
 OUT_DIM = {2: 39, 4: 35, 6: 31}
-# for 64 x 64 inputs
-OUT_DIM_64 = {2: 29, 4: 25, 6: 21}
 
 
 class PixelEncoder(nn.Module):
     """Convolutional encoder of pixels observations."""
-    def __init__(self, obs_shape, feature_dim, num_layers=2, num_filters=32,output_logits=False):
+    def __init__(self, obs_shape, feature_dim, num_layers=2, num_filters=32):
         super(PixelEncoder, self).__init__()
 
         assert len(obs_shape) == 3
-        self.obs_shape = obs_shape
+
         self.feature_dim = feature_dim
         self.num_layers = num_layers
 
@@ -387,12 +252,11 @@ class PixelEncoder(nn.Module):
         for i in range(num_layers - 1):
             self.convs.append(nn.Conv2d(num_filters, num_filters, 3, stride=1))
 
-        out_dim = OUT_DIM_64[num_layers] if obs_shape[-1] == 64 else OUT_DIM[num_layers] 
+        out_dim = OUT_DIM[num_layers]
         self.fc = nn.Linear(num_filters * out_dim * out_dim, self.feature_dim)
         self.ln = nn.LayerNorm(self.feature_dim)
 
         self.outputs = dict()
-        self.output_logits = output_logits
 
     def reparameterize(self, mu, logstd):
         std = torch.exp(logstd)
@@ -425,11 +289,8 @@ class PixelEncoder(nn.Module):
         h_norm = self.ln(h_fc)
         self.outputs['ln'] = h_norm
 
-        if self.output_logits:
-            out = h_norm
-        else:
-            out = torch.tanh(h_norm)
-            self.outputs['tanh'] = out
+        out = torch.tanh(h_norm)
+        self.outputs['tanh'] = out
 
         return out
 
@@ -455,7 +316,7 @@ class PixelEncoder(nn.Module):
 
 
 class IdentityEncoder(nn.Module):
-    def __init__(self, obs_shape, feature_dim, num_layers, num_filters,*args):
+    def __init__(self, obs_shape, feature_dim, num_layers, num_filters):
         super().__init__()
 
         assert len(obs_shape) == 1
@@ -475,12 +336,86 @@ _AVAILABLE_ENCODERS = {'pixel': PixelEncoder, 'identity': IdentityEncoder}
 
 
 def make_encoder(
-    encoder_type, obs_shape, feature_dim, num_layers, num_filters, output_logits=False
+    encoder_type, obs_shape, feature_dim, num_layers, num_filters
 ):
     assert encoder_type in _AVAILABLE_ENCODERS
     return _AVAILABLE_ENCODERS[encoder_type](
-        obs_shape, feature_dim, num_layers, num_filters, output_logits
+        obs_shape, feature_dim, num_layers, num_filters
     )
+
+#----------------------------------------------------------------------------
+
+
+class PixelDecoder(nn.Module):
+    def __init__(self, obs_shape, feature_dim, num_layers=2, num_filters=32):
+        super(PixelDecoder, self).__init__()
+
+        self.num_layers = num_layers
+        self.num_filters = num_filters
+        self.out_dim = OUT_DIM[num_layers]
+
+        self.fc = nn.Linear(
+            feature_dim, num_filters * self.out_dim * self.out_dim
+        )
+
+        self.deconvs = nn.ModuleList()
+
+        for i in range(self.num_layers - 1):
+            self.deconvs.append(
+                nn.ConvTranspose2d(num_filters, num_filters, 3, stride=1)
+            )
+        self.deconvs.append(
+            nn.ConvTranspose2d(
+                num_filters, obs_shape[0], 3, stride=2, output_padding=1
+            )
+        )
+
+        self.outputs = dict()
+
+    def forward(self, h):
+        h = torch.relu(self.fc(h))
+        self.outputs['fc'] = h
+
+        deconv = h.view(-1, self.num_filters, self.out_dim, self.out_dim)
+        self.outputs['deconv1'] = deconv
+
+        for i in range(0, self.num_layers - 1):
+            deconv = torch.relu(self.deconvs[i](deconv))
+            self.outputs['deconv%s' % (i + 1)] = deconv
+
+        obs = self.deconvs[-1](deconv)
+        self.outputs['obs'] = obs
+
+        return obs
+
+    # def log(self, L, step, log_freq):
+    #     if step % log_freq != 0:
+    #         return
+
+    #     for k, v in self.outputs.items():
+    #         L.log_histogram('train_decoder/%s_hist' % k, v, step)
+    #         if len(v.shape) > 2:
+    #             L.log_image('train_decoder/%s_i' % k, v[0], step)
+
+    #     for i in range(self.num_layers):
+    #         L.log_param(
+    #             'train_decoder/deconv%s' % (i + 1), self.deconvs[i], step
+    #         )
+    #     L.log_param('train_decoder/fc', self.fc, step)
+
+
+_AVAILABLE_DECODERS = {'pixel': PixelDecoder}
+
+
+def make_decoder(
+    decoder_type, obs_shape, feature_dim, num_layers, num_filters
+):
+    assert decoder_type in _AVAILABLE_DECODERS
+    return _AVAILABLE_DECODERS[decoder_type](
+        obs_shape, feature_dim, num_layers, num_filters
+    )
+
+#------------------------------------------------
 
 LOG_FREQ = 10000
 
@@ -528,7 +463,7 @@ class Actor(nn.Module):
 
         self.encoder = make_encoder(
             encoder_type, obs_shape, encoder_feature_dim, num_layers,
-            num_filters, output_logits=True
+            num_filters
         )
 
         self.log_std_min = log_std_min
@@ -629,7 +564,7 @@ class Critic(nn.Module):
 
         self.encoder = make_encoder(
             encoder_type, obs_shape, encoder_feature_dim, num_layers,
-            num_filters, output_logits=True
+            num_filters
         )
 
         self.Q1 = QFunction(
@@ -670,53 +605,8 @@ class Critic(nn.Module):
     #         L.log_param('train_critic/q2_fc%d' % i, self.Q2.trunk[i * 2], step)
 
 
-class CURL(nn.Module):
-    """
-    CURL
-    """
-
-    def __init__(self, obs_shape, z_dim, batch_size, critic, critic_target, output_type="continuous"):
-        super(CURL, self).__init__()
-        self.batch_size = batch_size
-
-        self.encoder = critic.encoder
-
-        self.encoder_target = critic_target.encoder 
-
-        self.W = nn.Parameter(torch.rand(z_dim, z_dim))
-        self.output_type = output_type
-
-    def encode(self, x, detach=False, ema=False):
-        """
-        Encoder: z_t = e(x_t)
-        :param x: x_t, x y coordinates
-        :return: z_t, value in r2
-        """
-        if ema:
-            with torch.no_grad():
-                z_out = self.encoder_target(x)
-        else:
-            z_out = self.encoder(x)
-
-        if detach:
-            z_out = z_out.detach()
-        return z_out
-
-    def compute_logits(self, z_a, z_pos):
-        """
-        Uses logits trick for CURL:
-        - compute (B,B) matrix z_a (W z_pos.T)
-        - positives are all diagonal elements
-        - negatives are all other elements
-        - to compute loss use multiclass cross entropy with identity matrix for labels
-        """
-        Wz = torch.matmul(self.W, z_pos.T)  # (z_dim,B)
-        logits = torch.matmul(z_a, Wz)  # (B,B)
-        logits = logits - torch.max(logits, 1)[0][:, None]
-        return logits
-
-class CurlSacAgent(object):
-    """CURL representation learning with SAC."""
+class SacAeAgent(object):
+    """SAC+AE algorithm."""
     def __init__(
         self,
         obs_shape,
@@ -740,12 +630,13 @@ class CurlSacAgent(object):
         encoder_feature_dim=50,
         encoder_lr=1e-3,
         encoder_tau=0.005,
+        decoder_type='pixel',
+        decoder_lr=1e-3,
+        decoder_update_freq=1000001,
+        decoder_latent_lambda=0.0,
+        decoder_weight_lambda=0.0,
         num_layers=4,
-        num_filters=32,
-        cpc_update_freq=1,
-        log_interval=100,
-        detach_encoder=False,
-        curl_latent_dim=128
+        num_filters=32
     ):
         self.device = device
         self.discount = discount
@@ -753,12 +644,8 @@ class CurlSacAgent(object):
         self.encoder_tau = encoder_tau
         self.actor_update_freq = actor_update_freq
         self.critic_target_update_freq = critic_target_update_freq
-        self.cpc_update_freq = cpc_update_freq
-        self.log_interval = log_interval
-        self.image_size = obs_shape[-1]
-        self.curl_latent_dim = curl_latent_dim
-        self.detach_encoder = detach_encoder
-        self.encoder_type = encoder_type
+        self.decoder_update_freq = decoder_update_freq
+        self.decoder_latent_lambda = decoder_latent_lambda
 
         self.actor = Actor(
             obs_shape, action_shape, hidden_dim, encoder_type,
@@ -778,14 +665,35 @@ class CurlSacAgent(object):
 
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        # tie encoders between actor and critic, and CURL and critic
+        # tie encoders between actor and critic
         self.actor.encoder.copy_conv_weights_from(self.critic.encoder)
 
         self.log_alpha = torch.tensor(np.log(init_temperature)).to(device)
         self.log_alpha.requires_grad = True
         # set target entropy to -|A|
         self.target_entropy = -np.prod(action_shape)
-        
+
+        self.decoder = None
+        if decoder_type != 'identity':
+            # create decoder
+            self.decoder = make_decoder(
+                decoder_type, obs_shape, encoder_feature_dim, num_layers,
+                num_filters
+            ).to(device)
+            self.decoder.apply(weight_init)
+
+            # optimizer for critic encoder for reconstruction loss
+            self.encoder_optimizer = torch.optim.Adam(
+                self.critic.encoder.parameters(), lr=encoder_lr
+            )
+
+            # optimizer for decoder
+            self.decoder_optimizer = torch.optim.Adam(
+                self.decoder.parameters(),
+                lr=decoder_lr,
+                weight_decay=decoder_weight_lambda
+            )
+
         # optimizers
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(), lr=actor_lr, betas=(actor_beta, 0.999)
@@ -799,21 +707,6 @@ class CurlSacAgent(object):
             [self.log_alpha], lr=alpha_lr, betas=(alpha_beta, 0.999)
         )
 
-        if self.encoder_type == 'pixel':
-            # create CURL encoder (the 128 batch size is probably unnecessary)
-            self.CURL = CURL(obs_shape, encoder_feature_dim,
-                        self.curl_latent_dim, self.critic,self.critic_target, output_type='continuous').to(self.device)
-
-            # optimizer for critic encoder for reconstruction loss
-            self.encoder_optimizer = torch.optim.Adam(
-                self.critic.encoder.parameters(), lr=encoder_lr
-            )
-
-            self.cpc_optimizer = torch.optim.Adam(
-                self.CURL.parameters(), lr=encoder_lr
-            )
-        self.cross_entropy_loss = nn.CrossEntropyLoss()
-
         self.train()
         self.critic_target.train()
 
@@ -821,16 +714,16 @@ class CurlSacAgent(object):
         self.training = training
         self.actor.train(training)
         self.critic.train(training)
-        if self.encoder_type == 'pixel':
-            self.CURL.train(training)
+        if self.decoder is not None:
+            self.decoder.train(training)
 
     @property
     def alpha(self):
         return self.log_alpha.exp()
 
     def select_action(self, obs, pose):
-        if obs.shape[-1] != self.image_size:
-            obs = center_crop_image(obs, self.image_size)
+        # if obs.shape[-1] != self.image_size:
+        #     obs = center_crop_image(obs, self.image_size)
 
         with torch.no_grad():
             obs = torch.FloatTensor(obs).to(self.device)
@@ -840,8 +733,8 @@ class CurlSacAgent(object):
             return mu.cpu().data.numpy().flatten()
 
     def sample_action(self, obs, pose):
-        if obs.shape[-1] != self.image_size:
-            obs = center_crop_image(obs, self.image_size)
+        # if obs.shape[-1] != self.image_size:
+        #     obs = center_crop_image(obs, self.image_size)
  
         with torch.no_grad():
             obs = torch.FloatTensor(obs).to(self.device)
@@ -850,9 +743,7 @@ class CurlSacAgent(object):
             mu, pi, _, _ = self.actor(obs, pose, compute_log_pi=False)
             return pi.cpu().data.numpy().flatten()
 
-    def update_critic(self, obs, pose, action, reward, next_obs, next_pose, not_done, step, weights, writer):
-        weights    = torch.FloatTensor(weights).unsqueeze(1).to(self.device)
-
+    def update_critic(self, obs, pose, action, reward, next_obs, next_pose, not_done, step, writer):
         with torch.no_grad():
             _, policy_action, log_pi, _ = self.actor(next_obs, next_pose)
             target_Q1, target_Q2 = self.critic_target(next_obs, next_pose, policy_action)
@@ -862,17 +753,10 @@ class CurlSacAgent(object):
 
         # get current Q estimates
         current_Q1, current_Q2 = self.critic(
-            obs, pose, action, detach_encoder=self.detach_encoder)
-        # critic_loss = F.mse_loss(current_Q1,
-        #                          target_Q) + F.mse_loss(current_Q2, target_Q)
-        td_error1 = target_Q.detach()-current_Q1
-        td_error2 = target_Q.detach()-current_Q2
-        critic1_loss = 0.5* (td_error1.pow(2)*weights).mean()
-        critic2_loss = 0.5* (td_error2.pow(2).to(self.device)*weights).mean()
-        prios = abs(((td_error1 + td_error2)/2.0 + 1e-5).squeeze())
-
-        critic_loss = critic1_loss + critic2_loss
-
+            obs, pose, action)
+        critic_loss = F.mse_loss(current_Q1,
+                                 target_Q) + F.mse_loss(current_Q2, target_Q)
+        
         writer.add_scalar('Loss critic', critic_loss, step)
         # if step % self.log_interval == 0:
         #     L.log('train_critic/loss', critic_loss, step)
@@ -884,7 +768,6 @@ class CurlSacAgent(object):
         self.critic_optimizer.step()
 
         # self.critic.log(L, step)
-        return prios
 
     def update_actor_and_alpha(self, obs, pose, step):
         # detach encoder, so we don't update it with the actor loss
@@ -922,39 +805,37 @@ class CurlSacAgent(object):
         alpha_loss.backward()
         self.log_alpha_optimizer.step()
 
-    def update_cpc(self, obs_anchor, obs_pos, cpc_kwargs, step):
-        
-        z_a = self.CURL.encode(obs_anchor)
-        z_pos = self.CURL.encode(obs_pos, ema=True)
-        
-        logits = self.CURL.compute_logits(z_a, z_pos)
-        labels = torch.arange(logits.shape[0]).long().to(self.device)
-        loss = self.cross_entropy_loss(logits, labels)
-        
+    def update_decoder(self, obs, target_obs, step):
+        h = self.critic.encoder(obs)
+
+        if target_obs.dim() == 4:
+            # preprocess images to be in [-0.5, 0.5] range
+            target_obs = preprocess_obs(target_obs)
+        rec_obs = self.decoder(h)
+        rec_loss = F.mse_loss(target_obs, rec_obs)
+
+        # add L2 penalty on latent representation
+        # see https://arxiv.org/pdf/1903.12436.pdf
+        latent_loss = (0.5 * h.pow(2).sum(1)).mean()
+
+        loss = rec_loss + self.decoder_latent_lambda * latent_loss
         self.encoder_optimizer.zero_grad()
-        self.cpc_optimizer.zero_grad()
+        self.decoder_optimizer.zero_grad()
         loss.backward()
 
-        writer.add_scalar('Loss curl', loss, step)
-
         self.encoder_optimizer.step()
-        self.cpc_optimizer.step()
-        # if step % self.log_interval == 0:
-            # L.log('train/curl_loss', loss, step)
+        self.decoder_optimizer.step()
+        # L.log('train_ae/ae_loss', loss, step)
 
+        # self.decoder.log(L, step, log_freq=LOG_FREQ)
 
-    def update(self, replay_buffer, step, writer):
-        if self.encoder_type == 'pixel':
-            obs, pose, action, reward, next_obs, next_pose, not_done, cpc_kwargs, idx, weights = replay_buffer.sample_cpc()
-        else:
-            obs, action, reward, next_obs, not_done = replay_buffer.sample_proprio()
-    
-        # if step % self.log_interval == 0:
-            # L.log('train/batch_reward', reward.mean(), step)
+    def update(self, replay_buffer, step):
+        # obs, action, reward, next_obs, not_done = replay_buffer.sample()
+        obs, pose, action, reward, next_obs, next_pose, not_done = replay_buffer.sample()
 
-        prios = self.update_critic(obs, pose, action, reward, next_obs, next_pose, not_done, step, weights, writer)
+        # L.log('train/batch_reward', reward.mean(), step)
 
-        replay_buffer.update_priorities(idx, prios.data.cpu().numpy())
+        self.update_critic(obs, pose, action, reward, next_obs, next_pose, not_done, step, writer)
 
         if step % self.actor_update_freq == 0:
             self.update_actor_and_alpha(obs, pose, step)
@@ -970,10 +851,9 @@ class CurlSacAgent(object):
                 self.critic.encoder, self.critic_target.encoder,
                 self.encoder_tau
             )
-        
-        if step % self.cpc_update_freq == 0 and self.encoder_type == 'pixel':
-            obs_anchor, obs_pos = cpc_kwargs["obs_anchor"], cpc_kwargs["obs_pos"]
-            self.update_cpc(obs_anchor, obs_pos,cpc_kwargs, step)
+
+        # if self.decoder is not None and step % self.decoder_update_freq == 0:
+        #     self.update_decoder(obs, obs, step)
 
     def save(self, model_dir, step):
         torch.save(
@@ -982,11 +862,11 @@ class CurlSacAgent(object):
         torch.save(
             self.critic.state_dict(), '%s/SAC_model/critic_%s.pt' % (model_dir, step)
         )
-
-    def save_curl(self, model_dir, step):
-        torch.save(
-            self.CURL.state_dict(), '%s/SAC_model/curl_%s.pt' % (model_dir, step)
-        )
+        if self.decoder is not None:
+            torch.save(
+                self.decoder.state_dict(),
+                '%s/SAC_model/decoder_%s.pt' % (model_dir, step)
+            )
 
     def load(self, model_dir, step):
         self.actor.load_state_dict(
@@ -995,13 +875,14 @@ class CurlSacAgent(object):
         self.critic.load_state_dict(
             torch.load('%s/SAC_model/critic_%s.pt' % (model_dir, step))
         )
-        self.CURL.load_state_dict(
-            torch.load('%s/SAC_model/curl_%s.pt' % (model_dir, step))
-        )
+        if self.decoder is not None:
+            self.decoder.load_state_dict(
+                torch.load('%s/SAC_model/decoder_%s.pt' % (model_dir, step))
+            )
 
 def make_agent(obs_shape, action_shape, device):
     # if args.agent == 'curl_sac':
-    return CurlSacAgent(
+    return SacAeAgent(
         obs_shape=obs_shape,
         action_shape=action_shape,
         device=device,
@@ -1023,12 +904,13 @@ def make_agent(obs_shape, action_shape, device):
         encoder_feature_dim=50,
         encoder_lr=1e-3,
         encoder_tau=0.05,
+        decoder_type='pixel',
+        decoder_lr=1e-3,
+        decoder_update_freq=1,
+        decoder_latent_lambda=1e-6,
+        decoder_weight_lambda=1e-7,
         num_layers=4,
-        num_filters=32,
-        log_interval=100,
-        detach_encoder=False,
-        curl_latent_dim=128
-
+        num_filters=32
     )
     # else:
     #     assert 'agent is not supported: %s' % args.agent
@@ -1067,13 +949,10 @@ def evaluate(num_episodes=3, encoder_type='pixel', image_size=84):
         for i in range(num_episodes):
             obs, pose = env.reset()
             pose = np.array(pose)
-            # print('-print aqui---------------------')
             done = False
             episode_reward = 0
             step = 0
             while not done:
-                if encoder_type == 'pixel':
-                    obs = center_crop_image(obs, image_size)
                 with eval_mode(agent):
                     if sample_stochastically:
                         action = agent.sample_action(obs, pose)
@@ -1091,7 +970,6 @@ def evaluate(num_episodes=3, encoder_type='pixel', image_size=84):
                             ])
                 obs, pose, reward, done = env.step(unnorm_action)
                 pose = np.array(pose)
-                # print('pose', pose)
 
                 episode_reward += reward
                 step +=1
@@ -1121,13 +999,13 @@ if __name__ == '__main__':
 
     action_shape = 3
     obs_shape = (3*3, 84, 84)
-    pre_aug_obs_shape = (3*3, 100, 100)
+    pre_aug_obs_shape = (3*3, 84, 84)
 
     episode, episode_reward, done = 0, 0, True
     max_steps = 1000000
     initial_step = 0
     # initial_step = 25000
-    save_model_replay = False
+    save_model_replay = True
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     replay_buffer = ReplayBuffer(
@@ -1136,11 +1014,10 @@ if __name__ == '__main__':
         capacity=replay_buffer_size,
         batch_size=128,
         device=device,
-        image_size=84,
     )
 
     agent = make_agent(
-        obs_shape=obs_shape,
+        obs_shape=pre_aug_obs_shape,
         action_shape=action_shape,
         device=device
     )
@@ -1159,8 +1036,8 @@ if __name__ == '__main__':
             writer.add_scalar('Reward best', best, step)
             if save_model_replay:
                 if step%(1*1000) == 0:
-                    agent.save(dirPath, step)
-                    agent.save_curl(dirPath, step)
+                    agent.save(dirPath, 0)
+                    # agent.save_curl(dirPath, step)
                     # replay_buffer.save(dirPath + '/replay_memory/')
                     print('saved model and replay memory', step)
             # obs = env.reset()
@@ -1208,7 +1085,9 @@ if __name__ == '__main__':
             num_updates = 1 
             for _ in range(num_updates):
                 # print('update')
-                agent.update(replay_buffer, step, writer)
+                agent.update(replay_buffer, step)
+
+        # print('action2 ', unnorm_action)
 
         next_obs, next_pose, reward, done = env.step(unnorm_action)
         next_pose = np.array(next_pose)

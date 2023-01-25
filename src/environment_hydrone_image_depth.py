@@ -42,9 +42,6 @@ dirPath = os.path.dirname(os.path.realpath(__file__))
 
 class Env():
     def __init__(self, action_dim=2):
-        self.test_aux = 0
-        self.test_air_water = [0,0]
-        self.test_air_water_aux = 0
         self.goal_x = 0
         self.goal_y = 0
         self.goal_z = 0
@@ -65,11 +62,15 @@ class Env():
         self.stopped = 0
         self.action_dim = action_dim
         self.bridge = CvBridge()
+        self.bridge_pixel = CvBridge()
         self._frames = deque([], maxlen=3)
         self._frames_print = deque([], maxlen=3)
-        # self.image_sub = rospy.Subscriber('/hydrone_aerial_underwater/camera/rgb/image_raw', Image, self.image_callback)
-        self.image_sub = rospy.Subscriber("/hydrone_aerial_underwater/camera/depth/image_raw", Image, self.image_callback)
+        self._frames_pixel = deque([], maxlen=3)
+        self._frames_print_pixel = deque([], maxlen=3)
+        self.image_sub = rospy.Subscriber('/hydrone_aerial_underwater/camera/rgb/image_raw', Image, self.image_pixel_callback)
         rospy.sleep(1)
+        self.image_sub = rospy.Subscriber("/hydrone_aerial_underwater/camera/depth/image_raw", Image, self.image_callback)
+        rospy.sleep(2)
         #Keys CTRL + c will stop script
         rospy.on_shutdown(self.shutdown)
 
@@ -78,6 +79,16 @@ class Env():
         rospy.loginfo("Stopping TurtleBot")
         self.pub_cmd_vel.publish(Twist())
         rospy.sleep(1)
+
+    def image_pixel_callback(self, data):
+        try:
+            cv_image = self.bridge_pixel.imgmsg_to_cv2(data, 'bgr8')
+            self.cv_image_pixel = cv2.resize(cv_image.copy(), (100, 100), interpolation = cv2.INTER_AREA)
+            cv2.imshow("Current_O_pixel", cv2.resize(self.cv_image_pixel.copy(), (500, 400), interpolation = cv2.INTER_AREA))
+            cv2.imwrite(dirPath + '/pixel_test.png', cv2.resize(self.cv_image_pixel.copy(), (500, 400), interpolation = cv2.INTER_AREA))
+            cv2.waitKey(3)
+        except CvBridgeError as e:
+            print(e)
 
     def image_callback(self, data):
         try:
@@ -94,8 +105,9 @@ class Env():
             # norm_image = cv2.normalize(norm_image, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
             norm_image = cv2.resize(norm_image.copy(), (100, 100), interpolation = cv2.INTER_AREA)
             self.cv_image = cv2.cvtColor(norm_image, cv2.COLOR_GRAY2BGR)
-            cv2.imshow("Current_Observation", cv2.resize(self.cv_image.copy(), (500, 400), interpolation = cv2.INTER_AREA))
-            cv2.waitKey(3)
+            # cv2.imshow("Current_O_depth", cv2.resize(self.cv_image.copy(), (500, 400), interpolation = cv2.INTER_AREA))
+            cv2.imwrite(dirPath + '/depth_test.png', cv2.resize(self.cv_image.copy(), (500, 400), interpolation = cv2.INTER_AREA))
+            # cv2.waitKey(3)
         except CvBridgeError as e:
             print(e)
 
@@ -161,7 +173,7 @@ class Env():
         pose_target = [self.heading, self.heading_z, current_distance] + position_agent + positon_goal
         # print('pose_target', pose_target)
 
-        return self.cv_image.transpose(2, 0, 1).copy(), pose_target, done
+        return self.cv_image.transpose(2, 0, 1).copy(), self.cv_image_pixel.transpose(2, 0, 1).copy(), pose_target, done
 
         
 
@@ -173,6 +185,7 @@ class Env():
                 reward = reward - 0.01
             if reward > 0.: 
                 reward = reward + 0.01
+            # print('---------tranisfw')
 
         if self.position.z < -0.75:
             reward = -0.1
@@ -184,30 +197,10 @@ class Env():
             self.pub_cmd_vel.publish(Twist())
             # self.reset()
             self.respawn_goal.counter = 0
-
-            ###
-            # if self.test_air_water_aux == 0:
-            #    # print('hi----------')
-            NAME = 'test_success.csv'
-            file_object = open(dirPath + '/test/' + NAME, 'a')
-            file_object.write(str(self.test_aux)+"," + str(self.test_air_water[0]) + "," + str(self.test_air_water[1]) + '\n')
-                
-            ###
             
 
         if self.get_goalbox:
             rospy.loginfo("Goal!! ")
-            ###
-            if self.test_air_water_aux == 0:
-                self.test_air_water[0] = 1
-                self.test_air_water_aux = 1
-            else:
-                self.test_air_water[1] = 1
-                NAME = 'test_success.csv'
-                file_object = open(dirPath + '/test/' + NAME, 'a')
-                file_object.write(str(self.test_aux)+"," + str(self.test_air_water[0]) + "," + str(self.test_air_water[1]) + '\n')
-                done = True
-            ###
             reward = 1.
             self.pub_cmd_vel.publish(Twist())
             self.goal_x, self.goal_y, self.goal_z = self.respawn_goal.getPosition(True, delete=True)
@@ -234,30 +227,34 @@ class Env():
             except:
                 pass
 
-        state, pose_target, done = self.getState(data)
+        state, state_pixel, pose_target, done = self.getState(data)
         reward, done = self.setReward(state, done)
 
         self._frames.append(state)
+        self._frames_pixel.append(state_pixel)
 
         self._frames_print.append(state.transpose(1, 2, 0).copy())
+        self._frames_print_pixel.append(state_pixel.transpose(1, 2, 0).copy())
 
-        # print('aqui', self._frames_print)
+        # print('----------------')
+        # print(self._get_obs().shape)
+        # print(np.concatenate(list(self._frames_print), axis=0).shape)
+        # rgb = np.dstack((self._get_obs_pixel()[0], self._get_obs_pixel()[1], self._get_obs_pixel()[2]))
+        # # aux = np.array([self._get_obs_pixel()[0], self._get_obs_pixel()[1], self._get_obs_pixel()[2]]).reshape(100,100,3)
+        # # print(self._get_obs_pixel()[0].shape)
+        # print(rgb.shape)
 
-        cv2.imwrite(dirPath + '/observation.png', np.concatenate(list(self._frames_print), axis=0))
-        
-        ###
-        NAME = 'test.csv'
-        file_object = open(dirPath + '/test/' + NAME, 'a')
-    
-        file_object.write(str(self.test_aux)+"," +str(self.position.x)+"," + str(self.position.y)+"," + str(self.position.z) + '\n')
-        ###
+        # cv2.imwrite(dirPath + '/observation_vai.png', rgb)
 
-        return self._get_obs(), pose_target, reward, done
+        # cv2.imshow("Current_O_pixel",  np.concatenate(list(self._frames_print_pixel), axis=0))
+        # cv2.waitKey(3)
+
+        cv2.imwrite(dirPath + '/observation_depth.png', np.concatenate(list(self._frames_print), axis=0))
+        cv2.imwrite(dirPath + '/observation_pixel.png', np.concatenate(list(self._frames_print_pixel), axis=0))
+
+        return self._get_obs(), self._get_obs_pixel(), pose_target, reward, done
 
     def reset(self):
-        self.test_aux +=1
-        self.test_air_water = [0,0]
-        self.test_air_water_aux = 0
         rospy.wait_for_service('gazebo/reset_simulation')
         try:
             self.reset_proxy()
@@ -271,29 +268,36 @@ class Env():
             except:
                 pass
         
-        state, pose_target, _ = self.getState(data)
+        state, state_pixel,pose_target, _ = self.getState(data)
         # print('aqui2')
         for _ in range(3):
-            # print('aqui')
+            # print('aqui-------------')
             self._frames.append(state)
+            self._frames_pixel.append(state_pixel)
 
         for _ in range(3):
             self._frames_print.append(state.transpose(1, 2, 0).copy())
+            self._frames_print_pixel.append(state_pixel.transpose(1, 2, 0).copy())
 
         if self.initGoal:
             self.goal_x, self.goal_y, self.goal_z = self.respawn_goal.getPosition()
             self.initGoal = False
         else:
-            self.goal_x, self.goal_y, self.goal_z = self.respawn_goal.getPosition(True, delete=True, init=True)
+            self.goal_x, self.goal_y, self.goal_z = self.respawn_goal.getPosition(True, delete=True, init=False)
         
         self.goal_distance = self.getGoalDistace()
 
         # print('aqui2')
 
         obs = self._get_obs()
+        obs_pixel = self._get_obs_pixel()
 
-        return obs, pose_target
+        return obs, obs_pixel, pose_target
 
     def _get_obs(self):
         assert len(self._frames) == 3
         return np.concatenate(list(self._frames), axis=0)
+        
+    def _get_obs_pixel(self):
+        assert len(self._frames_pixel) == 3
+        return np.concatenate(list(self._frames_pixel), axis=0)   

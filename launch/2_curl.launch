@@ -6,8 +6,8 @@
   <arg name="testing" default="false"/>
   <arg name="e_path" default="false"/>
 
-  <!-- <node pkg="curl_navigation" type="curl_prio_image_depth.py" name="curl_node" output="screen"> -->
-  <node pkg="curl_navigation" type="curl_prio.py" name="curl_node" output="screen">
+  <node pkg="curl_navigation" type="curl_prio_image_depth.py" name="curl_node" output="screen">
+  <!-- <node pkg="curl_navigation" type="curl_prio.py" name="curl_node" output="screen"> -->
     <param name="x_start"  value="$(arg x)"/>
     <param name="y_start"  value="$(arg y)"/>
     <param name="z_start"  value="$(arg z)"/>

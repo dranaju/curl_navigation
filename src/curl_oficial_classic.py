@@ -11,7 +11,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 from collections import deque
 from std_msgs.msg import Float32
-from environment_hydrone import Env
+from environment_hydrone_pixel import Env
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -99,12 +99,7 @@ def preprocess_obs(obs, bits=5):
 
 class ReplayBuffer(Dataset):
     """Buffer to store environment transitions."""
-    def __init__(
-                self, obs_shape, action_shape, 
-                capacity, batch_size, device,
-                image_size=84,transform=None,
-                alpha=0.6,beta_start = 0.4,beta_frames=100000
-                ):
+    def __init__(self, obs_shape, action_shape, capacity, batch_size, device,image_size=84,transform=None):
         self.capacity = capacity
         self.batch_size = batch_size
         self.device = device
@@ -126,32 +121,11 @@ class ReplayBuffer(Dataset):
         self.last_save = 0
         self.full = False
 
-        self.alpha = alpha
-        self.beta_start = beta_start
-        self.beta_frames = beta_frames
-        self.frame = 1 #for beta calculation
-        self.priorities = np.zeros((capacity,), dtype=np.float32)
-
-
-    def beta_by_frame(self, frame_idx):
-        """
-        Linearly increases beta from beta_start to 1 over time from 1 to beta_frames.
-        
-        3.4 ANNEALING THE BIAS (Paper: PER)
-        We therefore exploit the flexibility of annealing the amount of importance-sampling
-        correction over time, by defining a schedule on the exponent 
-        that reaches 1 only at the end of learning. In practice, we linearly anneal from its initial value 0 to 1
-        """
-        return min(1.0, self.beta_start + frame_idx * (1.0 - self.beta_start) / self.beta_frames)
-
 
     
 
     def add(self, obs, pose, action, reward, next_obs, next_pose, done):
-
-        max_prio = self.priorities.max() if (self.idx == 0 and not self.full) else 1.0
-        # print('max_prio', max_prio)
-
+       
         np.copyto(self.obses[self.idx], obs)
         np.copyto(self.poses[self.idx], pose)
         np.copyto(self.actions[self.idx], action)
@@ -160,7 +134,6 @@ class ReplayBuffer(Dataset):
         np.copyto(self.next_poses[self.idx], next_pose)
         np.copyto(self.not_dones[self.idx], not done)
 
-        self.priorities[self.idx] = max_prio
         self.idx = (self.idx + 1) % self.capacity
         self.full = self.full or self.idx == 0
 
@@ -185,40 +158,14 @@ class ReplayBuffer(Dataset):
         return obses, poses, actions, rewards, next_obses, next_poses, not_dones
 
     def sample_cpc(self):
-        if not self.full:
-            N = self.idx
-        else:
-            N = self.capacity
 
-        if N == self.capacity:
-            prios = self.priorities
-        else:
-            prios = self.priorities[:self.idx]
-
-        # calc P = p^a/sum(p^a)
-        probs  = prios ** self.alpha
-        P = probs/probs.sum()
-        
-        #gets the indices depending on the probability p
-        indices = np.random.choice(N, self.batch_size, p=P)
-        
-        beta = self.beta_by_frame(self.frame)
-        self.frame+=1
-                
-        #Compute importance-sampling weight
-        weights  = (N * P[indices]) ** (-beta)
-        # normalize weights
-        weights /= weights.max() 
-        weights  = np.array(weights, dtype=np.float32) 
-        
-
-        # start = time.time()
-        # idxs = np.random.randint(
-        #     0, self.capacity if self.full else self.idx, size=self.batch_size
-        # )
-        # print(type(self.obses))
-        obses = np.array([self.obses[idxs] for idxs in indices])
-        next_obses = np.array([self.next_obses[idxs] for idxs in indices])
+        start = time.time()
+        idxs = np.random.randint(
+            0, self.capacity if self.full else self.idx, size=self.batch_size
+        )
+      
+        obses = self.obses[idxs]
+        next_obses = self.next_obses[idxs]
         pos = obses.copy()
 
         obses = random_crop(obses, self.image_size)
@@ -229,18 +176,18 @@ class ReplayBuffer(Dataset):
         next_obses = torch.as_tensor(
             next_obses, device=self.device
         ).float()
-        poses = torch.as_tensor(np.array([self.poses[idxs] for idxs in indices]), device=self.device) 
-        next_poses = torch.as_tensor(np.array([self.next_poses[idxs] for idxs in indices]), device=self.device)
+        poses = torch.as_tensor(np.array(self.poses[idxs]), device=self.device) 
+        next_poses = torch.as_tensor(np.array(self.next_poses[idxs]), device=self.device)
 
-        actions = torch.as_tensor(np.array([self.actions[idxs] for idxs in indices]), device=self.device) 
-        rewards = torch.as_tensor(np.array([self.rewards[idxs] for idxs in indices]), device=self.device)
-        not_dones = torch.as_tensor(np.array([self.not_dones[idxs] for idxs in indices]), device=self.device)
+        actions = torch.as_tensor(self.actions[idxs], device=self.device)
+        rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
+        not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)
 
         pos = torch.as_tensor(pos, device=self.device).float()
         cpc_kwargs = dict(obs_anchor=obses, obs_pos=pos,
                           time_anchor=None, time_pos=None)
 
-        return obses, poses, actions, rewards, next_obses, next_poses, not_dones, cpc_kwargs, indices, weights
+        return obses, poses, actions, rewards, next_obses, next_poses, not_dones, cpc_kwargs
 
     def save(self, save_dir):
         if self.idx == self.last_save:
@@ -270,12 +217,6 @@ class ReplayBuffer(Dataset):
             self.rewards[start:end] = payload[3]
             self.not_dones[start:end] = payload[4]
             self.idx = end
-            self.last_save = end
-        print('Load memory until:' + str(self.idx))
-
-    def update_priorities(self, batch_indices, batch_priorities):
-        for idx, prio in zip(batch_indices, batch_priorities):
-            self.priorities[idx] = abs(prio) 
 
     # def __getitem__(self, idx):
     #     idx = np.random.randint(
@@ -403,6 +344,8 @@ class PixelEncoder(nn.Module):
         obs = obs / 255.
         self.outputs['obs'] = obs
 
+        # print('obs_aqui', obs.shape)
+
         conv = torch.relu(self.convs[0](obs))
         self.outputs['conv1'] = conv
 
@@ -410,7 +353,11 @@ class PixelEncoder(nn.Module):
             conv = torch.relu(self.convs[i](conv))
             self.outputs['conv%s' % (i + 1)] = conv
 
+        # print('aqui', conv.size(0))
+
         h = conv.view(conv.size(0), -1)
+
+        # print('aqui_h', h.shape)
         return h
 
     def forward(self, obs, detach=False):
@@ -539,6 +486,8 @@ class Actor(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, 2 * action_shape)
         )
+
+        # print(self.trunk)
 
         self.outputs = dict()
         self.apply(weight_init)
@@ -850,9 +799,7 @@ class CurlSacAgent(object):
             mu, pi, _, _ = self.actor(obs, pose, compute_log_pi=False)
             return pi.cpu().data.numpy().flatten()
 
-    def update_critic(self, obs, pose, action, reward, next_obs, next_pose, not_done, step, weights, writer):
-        weights    = torch.FloatTensor(weights).unsqueeze(1).to(self.device)
-
+    def update_critic(self, obs, pose, action, reward, next_obs, next_pose, not_done, step, writer):
         with torch.no_grad():
             _, policy_action, log_pi, _ = self.actor(next_obs, next_pose)
             target_Q1, target_Q2 = self.critic_target(next_obs, next_pose, policy_action)
@@ -863,16 +810,9 @@ class CurlSacAgent(object):
         # get current Q estimates
         current_Q1, current_Q2 = self.critic(
             obs, pose, action, detach_encoder=self.detach_encoder)
-        # critic_loss = F.mse_loss(current_Q1,
-        #                          target_Q) + F.mse_loss(current_Q2, target_Q)
-        td_error1 = target_Q.detach()-current_Q1
-        td_error2 = target_Q.detach()-current_Q2
-        critic1_loss = 0.5* (td_error1.pow(2)*weights).mean()
-        critic2_loss = 0.5* (td_error2.pow(2).to(self.device)*weights).mean()
-        prios = abs(((td_error1 + td_error2)/2.0 + 1e-5).squeeze())
-
-        critic_loss = critic1_loss + critic2_loss
-
+        critic_loss = F.mse_loss(current_Q1,
+                                 target_Q) + F.mse_loss(current_Q2, target_Q)
+        
         writer.add_scalar('Loss critic', critic_loss, step)
         # if step % self.log_interval == 0:
         #     L.log('train_critic/loss', critic_loss, step)
@@ -884,7 +824,6 @@ class CurlSacAgent(object):
         self.critic_optimizer.step()
 
         # self.critic.log(L, step)
-        return prios
 
     def update_actor_and_alpha(self, obs, pose, step):
         # detach encoder, so we don't update it with the actor loss
@@ -945,16 +884,14 @@ class CurlSacAgent(object):
 
     def update(self, replay_buffer, step, writer):
         if self.encoder_type == 'pixel':
-            obs, pose, action, reward, next_obs, next_pose, not_done, cpc_kwargs, idx, weights = replay_buffer.sample_cpc()
+            obs, pose, action, reward, next_obs, next_pose, not_done, cpc_kwargs = replay_buffer.sample_cpc()
         else:
             obs, action, reward, next_obs, not_done = replay_buffer.sample_proprio()
     
         # if step % self.log_interval == 0:
             # L.log('train/batch_reward', reward.mean(), step)
 
-        prios = self.update_critic(obs, pose, action, reward, next_obs, next_pose, not_done, step, weights, writer)
-
-        replay_buffer.update_priorities(idx, prios.data.cpu().numpy())
+        self.update_critic(obs, pose, action, reward, next_obs, next_pose, not_done, step, writer)
 
         if step % self.actor_update_freq == 0:
             self.update_actor_and_alpha(obs, pose, step)

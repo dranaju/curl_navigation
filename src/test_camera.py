@@ -54,7 +54,7 @@ if __name__ == "__main__":
     
     rospy.init_node("test", anonymous=False)
     rospy.Subscriber("/hydrone_aerial_underwater/camera/depth/image_raw", Image, image_callback)
-    rospy.sleep(2)
-    rospy.Subscriber("/hydrone_aerial_underwater/camera/rgb/image_raw", Image, image_callback_rgb)
+    # # rospy.sleep(2)
+    # rospy.Subscriber("/hydrone_aerial_underwater/camera/rgb/image_raw", Image, image_callback_rgb)
 
     rospy.spin()

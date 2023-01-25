@@ -7,13 +7,13 @@
   <arg name="e_path" default="false"/>
 
   <!-- <node pkg="curl_navigation" type="curl_prio_image_depth.py" name="curl_node" output="screen"> -->
-  <node pkg="curl_navigation" type="curl_prio.py" name="curl_node" output="screen">
+  <node pkg="curl_navigation" type="sac_cnn.py" name="curl_node" output="screen">
     <param name="x_start"  value="$(arg x)"/>
     <param name="y_start"  value="$(arg y)"/>
     <param name="z_start"  value="$(arg z)"/>
     <param name="scenario_2"  value="$(arg s_2)"/>
     <param name="eval_path"  value="$(arg e_path)"/>
     <param name="test_param"  value="$(arg testing)"/>
-    <param name="stage_number"  value="4"/>
+    <param name="stage_number"  value="0"/>
   </node>
 </launch>

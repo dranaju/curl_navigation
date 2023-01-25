@@ -112,6 +112,8 @@ class ReplayBuffer(Dataset):
         self.obses = np.empty((capacity, obs_shape[0], obs_shape[1], obs_shape[2]), dtype=obs_dtype)
         self.next_obses = np.empty((capacity, obs_shape[0], obs_shape[1], obs_shape[2]), dtype=obs_dtype)
         self.actions = np.empty((capacity, action_shape), dtype=np.float32)
+        self.poses = np.empty((capacity, 3+6), dtype=np.float32)
+        self.next_poses = np.empty((capacity, 3+6), dtype=np.float32)
         self.rewards = np.empty((capacity, 1), dtype=np.float32)
         self.not_dones = np.empty((capacity, 1), dtype=np.float32)
 
@@ -122,12 +124,14 @@ class ReplayBuffer(Dataset):
 
     
 
-    def add(self, obs, action, reward, next_obs, done):
+    def add(self, obs, pose, action, reward, next_obs, next_pose, done):
        
         np.copyto(self.obses[self.idx], obs)
+        np.copyto(self.poses[self.idx], pose)
         np.copyto(self.actions[self.idx], action)
         np.copyto(self.rewards[self.idx], reward)
         np.copyto(self.next_obses[self.idx], next_obs)
+        np.copyto(self.next_poses[self.idx], next_pose)
         np.copyto(self.not_dones[self.idx], not done)
 
         self.idx = (self.idx + 1) % self.capacity
@@ -143,13 +147,15 @@ class ReplayBuffer(Dataset):
         next_obses = self.next_obses[idxs]
 
         obses = torch.as_tensor(obses, device=self.device).float()
+        poses = torch.as_tensor(self.poses[idxs], device=self.device)
         actions = torch.as_tensor(self.actions[idxs], device=self.device)
         rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
         next_obses = torch.as_tensor(
             next_obses, device=self.device
         ).float()
+        next_poses = torch.as_tensor(self.next_poses[idxs], device=self.device)
         not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)
-        return obses, actions, rewards, next_obses, not_dones
+        return obses, poses, actions, rewards, next_obses, next_poses, not_dones
 
     def sample_cpc(self):
 
@@ -170,6 +176,9 @@ class ReplayBuffer(Dataset):
         next_obses = torch.as_tensor(
             next_obses, device=self.device
         ).float()
+        poses = torch.as_tensor(np.array(self.poses[idxs]), device=self.device) 
+        next_poses = torch.as_tensor(np.array(self.next_poses[idxs]), device=self.device)
+
         actions = torch.as_tensor(self.actions[idxs], device=self.device)
         rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
         not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)
@@ -178,7 +187,7 @@ class ReplayBuffer(Dataset):
         cpc_kwargs = dict(obs_anchor=obses, obs_pos=pos,
                           time_anchor=None, time_pos=None)
 
-        return obses, actions, rewards, next_obses, not_dones, cpc_kwargs
+        return obses, poses, actions, rewards, next_obses, next_poses, not_dones, cpc_kwargs
 
     def save(self, save_dir):
         if self.idx == self.last_save:
@@ -335,6 +344,8 @@ class PixelEncoder(nn.Module):
         obs = obs / 255.
         self.outputs['obs'] = obs
 
+        # print('obs_aqui', obs.shape)
+
         conv = torch.relu(self.convs[0](obs))
         self.outputs['conv1'] = conv
 
@@ -342,7 +353,11 @@ class PixelEncoder(nn.Module):
             conv = torch.relu(self.convs[i](conv))
             self.outputs['conv%s' % (i + 1)] = conv
 
+        # print('aqui', conv.size(0))
+
         h = conv.view(conv.size(0), -1)
+
+        # print('aqui_h', h.shape)
         return h
 
     def forward(self, obs, detach=False):
@@ -467,20 +482,33 @@ class Actor(nn.Module):
         self.log_std_max = log_std_max
 
         self.trunk = nn.Sequential(
-            nn.Linear(self.encoder.feature_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(self.encoder.feature_dim + 3+6, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, 2 * action_shape)
         )
+
+        # print(self.trunk)
 
         self.outputs = dict()
         self.apply(weight_init)
 
     def forward(
-        self, obs, compute_pi=True, compute_log_pi=True, detach_encoder=False
+        self, obs, pose, compute_pi=True, compute_log_pi=True, detach_encoder=False
     ):
         obs = self.encoder(obs, detach=detach_encoder)
 
-        mu, log_std = self.trunk(obs).chunk(2, dim=-1)
+        # print('encoder_q----------------------------')
+        # # print(obs)
+        # # print(type(obs))
+        # # print(obs.size())
+        # print(pose)
+        # print(type(pose))
+        # print(pose.size())
+        obs_pose = torch.cat([obs, pose], dim=1)
+        # print(type(obs_pose))
+        # print('-------------------------------------')
+
+        mu, log_std = self.trunk(obs_pose).chunk(2, dim=-1)
 
         # constrain log_std inside [log_std_min, log_std_max]
         log_std = torch.tanh(log_std)
@@ -526,15 +554,16 @@ class QFunction(nn.Module):
         super(QFunction, self).__init__()
 
         self.trunk = nn.Sequential(
-            nn.Linear(obs_dim + action_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(obs_dim + 3+6 + action_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
 
-    def forward(self, obs, action):
+    def forward(self, obs, pose, action):
         assert obs.size(0) == action.size(0)
 
-        obs_action = torch.cat([obs, action], dim=1)
+        obs_pose = torch.cat([obs, pose], dim=1)
+        obs_action = torch.cat([obs_pose, action], dim=1)
         return self.trunk(obs_action)
 
 
@@ -562,14 +591,14 @@ class Critic(nn.Module):
         self.outputs = dict()
         self.apply(weight_init)
 
-    def forward(self, obs, action, detach_encoder=False):
+    def forward(self, obs, pose, action, detach_encoder=False):
         # detach_encoder allows to stop gradient propogation to encoder
         obs = self.encoder(obs, detach=detach_encoder)
 
         # print('aqui13', obs.shape)
 
-        q1 = self.Q1(obs, action)
-        q2 = self.Q2(obs, action)
+        q1 = self.Q1(obs, pose, action)
+        q2 = self.Q2(obs, pose, action)
 
         self.outputs['q1'] = q1
         self.outputs['q2'] = q2
@@ -748,39 +777,43 @@ class CurlSacAgent(object):
     def alpha(self):
         return self.log_alpha.exp()
 
-    def select_action(self, obs):
+    def select_action(self, obs, pose):
         if obs.shape[-1] != self.image_size:
             obs = center_crop_image(obs, self.image_size)
 
         with torch.no_grad():
             obs = torch.FloatTensor(obs).to(self.device)
+            pose = torch.FloatTensor([pose]).to(self.device)
             obs = obs.unsqueeze(0)
-            mu, _, _, _ = self.actor(obs, compute_log_pi=False)
+            mu, _, _, _ = self.actor(obs, pose, compute_log_pi=False)
             return mu.cpu().data.numpy().flatten()
 
-    def sample_action(self, obs):
+    def sample_action(self, obs, pose):
         if obs.shape[-1] != self.image_size:
             obs = center_crop_image(obs, self.image_size)
  
         with torch.no_grad():
             obs = torch.FloatTensor(obs).to(self.device)
+            pose = torch.FloatTensor([pose]).to(self.device)
             obs = obs.unsqueeze(0)
-            mu, pi, _, _ = self.actor(obs, compute_log_pi=False)
+            mu, pi, _, _ = self.actor(obs, pose, compute_log_pi=False)
             return pi.cpu().data.numpy().flatten()
 
-    def update_critic(self, obs, action, reward, next_obs, not_done, step):
+    def update_critic(self, obs, pose, action, reward, next_obs, next_pose, not_done, step, writer):
         with torch.no_grad():
-            _, policy_action, log_pi, _ = self.actor(next_obs)
-            target_Q1, target_Q2 = self.critic_target(next_obs, policy_action)
+            _, policy_action, log_pi, _ = self.actor(next_obs, next_pose)
+            target_Q1, target_Q2 = self.critic_target(next_obs, next_pose, policy_action)
             target_V = torch.min(target_Q1,
                                  target_Q2) - self.alpha.detach() * log_pi
             target_Q = reward + (not_done * self.discount * target_V)
 
         # get current Q estimates
         current_Q1, current_Q2 = self.critic(
-            obs, action, detach_encoder=self.detach_encoder)
+            obs, pose, action, detach_encoder=self.detach_encoder)
         critic_loss = F.mse_loss(current_Q1,
                                  target_Q) + F.mse_loss(current_Q2, target_Q)
+        
+        writer.add_scalar('Loss critic', critic_loss, step)
         # if step % self.log_interval == 0:
         #     L.log('train_critic/loss', critic_loss, step)
 
@@ -792,10 +825,10 @@ class CurlSacAgent(object):
 
         # self.critic.log(L, step)
 
-    def update_actor_and_alpha(self, obs, step):
+    def update_actor_and_alpha(self, obs, pose, step):
         # detach encoder, so we don't update it with the actor loss
-        _, pi, log_pi, log_std = self.actor(obs, detach_encoder=True)
-        actor_Q1, actor_Q2 = self.critic(obs, pi, detach_encoder=True)
+        _, pi, log_pi, log_std = self.actor(obs, pose, detach_encoder=True)
+        actor_Q1, actor_Q2 = self.critic(obs, pose, pi, detach_encoder=True)
 
         actor_Q = torch.min(actor_Q1, actor_Q2)
         actor_loss = (self.alpha.detach() * log_pi - actor_Q).mean()
@@ -809,6 +842,8 @@ class CurlSacAgent(object):
             # L.log('train_actor/entropy', entropy.mean(), step)
 
         # optimize the actor
+        writer.add_scalar('Loss actor', actor_loss, step)
+
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
@@ -818,6 +853,8 @@ class CurlSacAgent(object):
         self.log_alpha_optimizer.zero_grad()
         alpha_loss = (self.alpha *
                       (-log_pi - self.target_entropy).detach()).mean()
+
+        writer.add_scalar('Loss alpha', alpha_loss, step)
         # if step % self.log_interval == 0:
             # L.log('train_alpha/loss', alpha_loss, step)
             # L.log('train_alpha/value', self.alpha, step)
@@ -837,25 +874,27 @@ class CurlSacAgent(object):
         self.cpc_optimizer.zero_grad()
         loss.backward()
 
+        writer.add_scalar('Loss curl', loss, step)
+
         self.encoder_optimizer.step()
         self.cpc_optimizer.step()
         # if step % self.log_interval == 0:
             # L.log('train/curl_loss', loss, step)
 
 
-    def update(self, replay_buffer, step):
+    def update(self, replay_buffer, step, writer):
         if self.encoder_type == 'pixel':
-            obs, action, reward, next_obs, not_done, cpc_kwargs = replay_buffer.sample_cpc()
+            obs, pose, action, reward, next_obs, next_pose, not_done, cpc_kwargs = replay_buffer.sample_cpc()
         else:
             obs, action, reward, next_obs, not_done = replay_buffer.sample_proprio()
     
         # if step % self.log_interval == 0:
             # L.log('train/batch_reward', reward.mean(), step)
 
-        self.update_critic(obs, action, reward, next_obs, not_done, step)
+        self.update_critic(obs, pose, action, reward, next_obs, next_pose, not_done, step, writer)
 
         if step % self.actor_update_freq == 0:
-            self.update_actor_and_alpha(obs, step)
+            self.update_actor_and_alpha(obs, pose, step)
 
         if step % self.critic_target_update_freq == 0:
             soft_update_params(
@@ -933,11 +972,11 @@ def make_agent(obs_shape, action_shape, device):
 
 
 #----------------------------------------------------------
-ACTION_V_MIN = 0.0 # m/s
-ACTION_W_MIN = -0.5 # rad/s
-ACTION_V_MAX = 0.20 # m/s
-ACTION_W_MAX = 0.5 # rad/s
-replay_buffer_size = 120000
+ACTION_V_MIN = -0.3 # m/s
+ACTION_W_MIN = -0.3 # rad/s
+ACTION_V_MAX = 0.3 # m/s
+ACTION_W_MAX = 0.3 # rad/s
+replay_buffer_size = 100000
 #****************************
 is_training = True
 #----------------------------------------
@@ -949,8 +988,9 @@ def action_unnormalized(action, high, low):
 
 writer = SummaryWriter(dirPath + '/evaluations/',flush_secs=1, max_queue=1)
 
-def evaluate(num_episodes=2, encoder_type='pixel', image_size=84):
+def evaluate(num_episodes=3, encoder_type='pixel', image_size=84):
     all_ep_rewards = []
+    print('evau')
 
     def run_eval_loop(sample_stochastically=True):
 
@@ -960,10 +1000,11 @@ def evaluate(num_episodes=2, encoder_type='pixel', image_size=84):
             print('stochastically evaluation')
         else:
             print('deterministic evaluation')
-        print('evau')
 
         for i in range(num_episodes):
-            obs = env.reset()
+            obs, pose = env.reset()
+            pose = np.array(pose)
+            # print('-print aqui---------------------')
             done = False
             episode_reward = 0
             step = 0
@@ -972,22 +1013,29 @@ def evaluate(num_episodes=2, encoder_type='pixel', image_size=84):
                     obs = center_crop_image(obs, image_size)
                 with eval_mode(agent):
                     if sample_stochastically:
-                        action = agent.sample_action(obs)
+                        action = agent.sample_action(obs, pose)
                         unnorm_action = np.array([
                             action_unnormalized(action[0], ACTION_V_MAX, 0), 
-                            action_unnormalized(action[1], ACTION_W_MAX, ACTION_W_MIN)
+                            action_unnormalized(action[1], ACTION_W_MAX, ACTION_W_MIN),
+                            action_unnormalized(action[2], ACTION_V_MAX, ACTION_V_MIN)
                             ])
                     else:
-                        action = agent.select_action(obs)
+                        action = agent.select_action(obs, pose)
                         unnorm_action = np.array([
                             action_unnormalized(action[0], ACTION_V_MAX, 0), 
-                            action_unnormalized(action[1], ACTION_W_MAX, ACTION_W_MIN)
+                            action_unnormalized(action[1], ACTION_W_MAX, ACTION_W_MIN),
+                            action_unnormalized(action[2], ACTION_V_MAX, ACTION_V_MIN)                            
                             ])
-                obs, reward, done = env.step(unnorm_action)
+                obs, pose, reward, done = env.step(unnorm_action)
+                pose = np.array(pose)
+                # print('pose', pose)
+
                 episode_reward += reward
                 step +=1
-                if step > 700:
+                if step > 1000:
+                    print('final', i, step)
                     done = True
+                    break
 
             all_ep_rewards.append(episode_reward)
 
@@ -1008,15 +1056,15 @@ if __name__ == '__main__':
     result = Float32()
     env = Env()
 
-    action_shape = 2
-    obs_shape = (3*5, 84, 84)
-    pre_aug_obs_shape = (3*5, 100, 100)
+    action_shape = 3
+    obs_shape = (3*3, 84, 84)
+    pre_aug_obs_shape = (3*3, 100, 100)
 
     episode, episode_reward, done = 0, 0, True
     max_steps = 1000000
-    # initial_step = 28000
-    initial_step = 22000
-    save_model_replay = True
+    initial_step = 0
+    # initial_step = 25000
+    save_model_replay = False
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     replay_buffer = ReplayBuffer(
@@ -1037,19 +1085,24 @@ if __name__ == '__main__':
     print('Path: ' + dirPath)
 
     # agent.load(dirPath, initial_step) # 5 + 149 + 30
+    # replay_buffer.load(dirPath + '/replay_memory/')
 
     for step in range(initial_step, max_steps):
         
         if step % 1000 == 0:
+            print('start_eval')
             mean, best = evaluate()
             writer.add_scalar('Reward mean', mean, step)
             writer.add_scalar('Reward best', best, step)
             if save_model_replay:
-                if step%(2*1000) == 0:
+                if step%(1*1000) == 0:
                     agent.save(dirPath, step)
                     agent.save_curl(dirPath, step)
-                    replay_buffer.save(dirPath + '/replay_memory/' )
+                    # replay_buffer.save(dirPath + '/replay_memory/')
                     print('saved model and replay memory', step)
+            # obs = env.reset()
+            done = True
+            save_model_replay = True
         
         if done:
             
@@ -1059,7 +1112,9 @@ if __name__ == '__main__':
             print('Reward average per ep: ' + str(episode_reward))
             print("*********************************")
 
-            obs = env.reset()
+            obs, pose = env.reset()
+            pose = np.array(pose)
+
             done = False
             episode_reward = 0
             episode += 1
@@ -1068,41 +1123,47 @@ if __name__ == '__main__':
             print('### Collecting memory ###')
             action = np.array([
                 np.random.uniform(-1, 1),
+                np.random.uniform(-1, 1),
                 np.random.uniform(-1, 1)
                 ]) 
             unnorm_action = np.array([
                 action_unnormalized(action[0], ACTION_V_MAX, 0), 
-                action_unnormalized(action[1], ACTION_W_MAX, ACTION_W_MIN)
+                action_unnormalized(action[1], ACTION_W_MAX, ACTION_W_MIN),
+                action_unnormalized(action[2], ACTION_V_MAX, ACTION_V_MIN)
                 ])
         else:
             with eval_mode(agent):
-                action = agent.sample_action(obs)
+                action = agent.sample_action(obs, pose)
                 # print('action1 ', unnorm_action)
                 unnorm_action = np.array([
                     action_unnormalized(action[0], ACTION_V_MAX, 0), 
-                    action_unnormalized(action[1], ACTION_W_MAX, ACTION_W_MIN)
+                    action_unnormalized(action[1], ACTION_W_MAX, ACTION_W_MIN),
+                    action_unnormalized(action[2], ACTION_V_MAX, ACTION_V_MIN)
                     ])
 
         if step >= (initial_step + 400): #1000
             num_updates = 1 
             for _ in range(num_updates):
                 # print('update')
-                agent.update(replay_buffer, step)
+                agent.update(replay_buffer, step, writer)
 
-        # print('action2 ', unnorm_action)
-
-        next_obs, reward, done = env.step(unnorm_action)
-        
+        next_obs, next_pose, reward, done = env.step(unnorm_action)
+        next_pose = np.array(next_pose)
+        # print('----')
+        # print('action ', unnorm_action)
+        # print('pose ', next_pose)
         # print('reward ', reward)
+        # print('----')
         # print('state ', obs.shape)
 
         episode_reward += reward
-        replay_buffer.add(obs, action, reward, next_obs, done)
-        if reward < -1.:
+        replay_buffer.add(obs, pose, action, reward, next_obs, next_pose, done)
+        if reward <= -1.:
             print('\n----collide-----\n')
-            for _ in range(3):
-                # print('aqui2')
-                replay_buffer.add(obs, action, reward, next_obs, done)
+            # for _ in range(1):
+            #     # print('aqui2')
+            #     replay_buffer.add(obs, action, reward, next_obs, done)
 
-        obs = next_obs
+        obs = copy.deepcopy(next_obs)
+        pose = copy.deepcopy(next_pose)
         # episode_step += 1
