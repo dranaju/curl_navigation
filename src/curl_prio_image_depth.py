@@ -688,13 +688,13 @@ class Critic(nn.Module):
     #         L.log_param('train_critic/q2_fc%d' % i, self.Q2.trunk[i * 2], step)
 
 
-class CURL(nn.Module):
+class CUPRL(nn.Module):
     """
-    CURL
+    CUPRL
     """
 
     def __init__(self, obs_shape, z_dim, batch_size, critic, critic_target, output_type="continuous"):
-        super(CURL, self).__init__()
+        super(CUPRL, self).__init__()
         self.batch_size = batch_size
 
         self.encoder = critic.encoder
@@ -722,7 +722,7 @@ class CURL(nn.Module):
 
     def compute_logits(self, z_a, z_pos):
         """
-        Uses logits trick for CURL:
+        Uses logits trick for CUPRL:
         - compute (B,B) matrix z_a (W z_pos.T)
         - positives are all diagonal elements
         - negatives are all other elements
@@ -733,8 +733,8 @@ class CURL(nn.Module):
         logits = logits - torch.max(logits, 1)[0][:, None]
         return logits
 
-class CurlSacAgent(object):
-    """CURL representation learning with SAC."""
+class CUPRLSacAgent(object):
+    """CUPRL representation learning with SAC."""
     def __init__(
         self,
         obs_shape,
@@ -763,7 +763,7 @@ class CurlSacAgent(object):
         cpc_update_freq=1,
         log_interval=100,
         detach_encoder=False,
-        curl_latent_dim=128
+        CUPRL_latent_dim=128
     ):
         self.device = device
         self.discount = discount
@@ -774,7 +774,7 @@ class CurlSacAgent(object):
         self.cpc_update_freq = cpc_update_freq
         self.log_interval = log_interval
         self.image_size = obs_shape[-1]
-        self.curl_latent_dim = curl_latent_dim
+        self.CUPRL_latent_dim = CUPRL_latent_dim
         self.detach_encoder = detach_encoder
         self.encoder_type = encoder_type
 
@@ -796,7 +796,7 @@ class CurlSacAgent(object):
 
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        # tie encoders between actor and critic, and CURL and critic
+        # tie encoders between actor and critic, and CUPRL and critic
         self.actor.encoder.copy_conv_weights_from(self.critic.encoder)
 
         self.log_alpha = torch.tensor(np.log(init_temperature)).to(device)
@@ -818,9 +818,9 @@ class CurlSacAgent(object):
         )
 
         if self.encoder_type == 'pixel':
-            # create CURL encoder (the 128 batch size is probably unnecessary)
-            self.CURL = CURL(obs_shape, encoder_feature_dim,
-                        self.curl_latent_dim, self.critic,self.critic_target, output_type='continuous').to(self.device)
+            # create CUPRL encoder (the 128 batch size is probably unnecessary)
+            self.CUPRL = CUPRL(obs_shape, encoder_feature_dim,
+                        self.CUPRL_latent_dim, self.critic,self.critic_target, output_type='continuous').to(self.device)
 
             # optimizer for critic encoder for reconstruction loss
             self.encoder_optimizer = torch.optim.Adam(
@@ -828,7 +828,7 @@ class CurlSacAgent(object):
             )
 
             self.cpc_optimizer = torch.optim.Adam(
-                self.CURL.parameters(), lr=encoder_lr
+                self.CUPRL.parameters(), lr=encoder_lr
             )
         self.cross_entropy_loss = nn.CrossEntropyLoss()
 
@@ -840,7 +840,7 @@ class CurlSacAgent(object):
         self.actor.train(training)
         self.critic.train(training)
         if self.encoder_type == 'pixel':
-            self.CURL.train(training)
+            self.CUPRL.train(training)
 
     @property
     def alpha(self):
@@ -942,10 +942,10 @@ class CurlSacAgent(object):
 
     def update_cpc(self, obs_anchor, obs_pos, cpc_kwargs, step):
         
-        z_a = self.CURL.encode(obs_anchor)
-        z_pos = self.CURL.encode(obs_pos, ema=True)
+        z_a = self.CUPRL.encode(obs_anchor)
+        z_pos = self.CUPRL.encode(obs_pos, ema=True)
         
-        logits = self.CURL.compute_logits(z_a, z_pos)
+        logits = self.CUPRL.compute_logits(z_a, z_pos)
         labels = torch.arange(logits.shape[0]).long().to(self.device)
         loss = self.cross_entropy_loss(logits, labels)
         
@@ -953,12 +953,12 @@ class CurlSacAgent(object):
         self.cpc_optimizer.zero_grad()
         loss.backward()
 
-        writer.add_scalar('Loss curl', loss, step)
+        writer.add_scalar('Loss CUPRL', loss, step)
 
         self.encoder_optimizer.step()
         self.cpc_optimizer.step()
         # if step % self.log_interval == 0:
-            # L.log('train/curl_loss', loss, step)
+            # L.log('train/CUPRL_loss', loss, step)
 
 
     def update(self, replay_buffer, step, writer):
@@ -1005,9 +1005,9 @@ class CurlSacAgent(object):
             self.critic.state_dict(), '%s/SAC_model/critic_%s.pt' % (model_dir, step)
         )
 
-    def save_curl(self, model_dir, step):
+    def save_CUPRL(self, model_dir, step):
         torch.save(
-            self.CURL.state_dict(), '%s/SAC_model/curl_%s.pt' % (model_dir, step)
+            self.CUPRL.state_dict(), '%s/SAC_model/CUPRL_%s.pt' % (model_dir, step)
         )
 
     def load(self, model_dir, step):
@@ -1017,13 +1017,13 @@ class CurlSacAgent(object):
         self.critic.load_state_dict(
             torch.load('%s/SAC_model/critic_%s.pt' % (model_dir, step))
         )
-        self.CURL.load_state_dict(
-            torch.load('%s/SAC_model/curl_%s.pt' % (model_dir, step))
+        self.CUPRL.load_state_dict(
+            torch.load('%s/SAC_model/CUPRL_%s.pt' % (model_dir, step))
         )
 
 def make_agent(obs_shape, action_shape, device):
-    # if args.agent == 'curl_sac':
-    return CurlSacAgent(
+    # if args.agent == 'CUPRL_sac':
+    return CUPRLSacAgent(
         obs_shape=obs_shape,
         action_shape=action_shape,
         device=device,
@@ -1049,7 +1049,7 @@ def make_agent(obs_shape, action_shape, device):
         num_filters=32,
         log_interval=100,
         detach_encoder=False,
-        curl_latent_dim=170
+        CUPRL_latent_dim=170
 
     )
     # else:
@@ -1136,7 +1136,7 @@ def evaluate(num_episodes=10000, encoder_type='pixel', image_size=100):
 
 
 if __name__ == '__main__':
-    rospy.init_node('curl_node')
+    rospy.init_node('CUPRL_node')
     pub_result = rospy.Publisher('result', Float32, queue_size=5)
     result = Float32()
     env = Env()
@@ -1182,7 +1182,7 @@ if __name__ == '__main__':
             if save_model_replay:
                 if step%(1*1000) == 0:
                     agent.save(dirPath, step)
-                    agent.save_curl(dirPath, step)
+                    agent.save_CUPRL(dirPath, step)
                     # replay_buffer.save(dirPath + '/replay_memory/')
                     print('saved model and replay memory', step)
             # obs = env.reset()
